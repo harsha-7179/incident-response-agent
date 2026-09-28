@@ -1,4 +1,5 @@
 """Fault injection. Each fault causes a *real* failure mode, not a fake log line."""
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ class Chaos:
         self.since: dict[str, str] = {}  # fault -> ISO time it was enabled
         self._leaked_conns: list = []
         self._leaked_blocks: list[bytes] = []
+        self._lock = threading.Lock()  # guards the leak lists against in-flight requests
 
     def is_on(self, fault: str) -> bool:
         return fault in self.since
@@ -38,13 +40,14 @@ class Chaos:
         self.since.setdefault(fault, datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     def disable(self, fault: str) -> None:
-        self.since.pop(fault, None)
-        if fault == "db_leak":
-            for conn in self._leaked_conns:
-                conn.close()
-            self._leaked_conns.clear()
-        if fault == "memory_leak":
-            self._leaked_blocks.clear()
+        with self._lock:
+            self.since.pop(fault, None)
+            if fault == "db_leak":
+                for conn in self._leaked_conns:
+                    conn.close()
+                self._leaked_conns.clear()
+            if fault == "memory_leak":
+                self._leaked_blocks.clear()
 
     def reset(self) -> None:
         for fault in FAULTS:
@@ -66,14 +69,23 @@ class Chaos:
         if self.is_on("db_leak"):
             # Checked out and never returned; once the pool is empty this raises
             # sqlalchemy.exc.TimeoutError ("QueuePool limit of size 5 overflow 0 reached").
-            self._leaked_conns.append(engine.connect())
+            conn = engine.connect()
+            with self._lock:
+                if self.is_on("db_leak"):
+                    self._leaked_conns.append(conn)
+                    conn = None
+            if conn is not None:  # fault was switched off while we waited for the pool
+                conn.close()
         if self.is_on("memory_leak"):
             if self.leaked_mb >= MEMORY_LIMIT_MB:
                 raise MemoryError(
                     f"Cannot allocate {LEAK_BLOCK_MB * 1024 * 1024} bytes: worker heap "
                     f"{self.leaked_mb} MB exceeds container limit {MEMORY_LIMIT_MB} MB"
                 )
-            self._leaked_blocks.append(b"x" * (LEAK_BLOCK_MB * 1024 * 1024))
+            block = b"x" * (LEAK_BLOCK_MB * 1024 * 1024)
+            with self._lock:
+                if self.is_on("memory_leak"):
+                    self._leaked_blocks.append(block)
             time.sleep(self.leaked_mb / 400)  # GC pauses grow with heap size
 
 

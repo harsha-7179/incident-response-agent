@@ -62,7 +62,7 @@ async def json_request_log(request: Request, call_next):
         exc_type = type(exc).__name__
         message = str(exc).splitlines()[0] if str(exc) else ""
         error = f"{exc_type}: {message}"[:300]
-        stack = "".join(traceback.format_exception(exc)[-4:])[-1200:]
+        stack = app_stack(exc)
         response = JSONResponse({"detail": error}, status_code=status)
 
     fields = {
@@ -82,6 +82,14 @@ async def json_request_log(request: Request, call_next):
     level = 40 if status >= 500 else 30 if status >= 400 else 20
     log.log(level, error or "ok", extra={"fields": fields})
     return response
+
+
+def app_stack(exc: Exception) -> str:
+    """Traceback limited to our own code (framework/library frames are noise for triage)."""
+    frames = [f for f in traceback.extract_tb(exc.__traceback__) if ".venv" not in f.filename
+              and "site-packages" not in f.filename] or traceback.extract_tb(exc.__traceback__)[-2:]
+    lines = traceback.format_list(frames[-4:]) + traceback.format_exception_only(exc)
+    return "".join(lines)[-1200:]
 
 
 def apply_chaos() -> None:
